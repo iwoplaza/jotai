@@ -169,10 +169,9 @@ type Store = {
 export const createStore = (): Store => {
   const atomStateMap = new WeakMap<AnyAtom, AtomState>()
   const mountedMap = new WeakMap<AnyAtom, Mounted>()
-  const pendingStack: Set<AnyAtom>[] = []
-  const pendingMap = new WeakMap<
+  const pendingMap = new Map<
     AnyAtom,
-    [prevAtomState: AtomState | undefined, dependents: Dependents]
+    AtomState /* prevAtomState */ | undefined
   >()
   let storeListenersRev2: Set<StoreListenerRev2>
   let mountedAtoms: MountedAtoms
@@ -184,20 +183,6 @@ export const createStore = (): Store => {
   const getAtomState = <Value>(atom: Atom<Value>) =>
     atomStateMap.get(atom) as AtomState<Value> | undefined
 
-  const addPendingDependent = (atom: AnyAtom, atomState: AtomState) => {
-    atomState.d.forEach((_, a) => {
-      if (!pendingMap.has(a)) {
-        const aState = getAtomState(a)
-        pendingStack[pendingStack.length - 1]?.add(a)
-        pendingMap.set(a, [aState, new Set()])
-        if (aState) {
-          addPendingDependent(a, aState)
-        }
-      }
-      pendingMap.get(a)![1].add(atom)
-    })
-  }
-
   const setAtomState = <Value>(
     atom: Atom<Value>,
     atomState: AtomState<Value>,
@@ -208,9 +193,7 @@ export const createStore = (): Store => {
     const prevAtomState = getAtomState(atom)
     atomStateMap.set(atom, atomState)
     if (!pendingMap.has(atom)) {
-      pendingStack[pendingStack.length - 1]?.add(atom)
-      pendingMap.set(atom, [prevAtomState, new Set()])
-      addPendingDependent(atom, atomState)
+      pendingMap.set(atom, prevAtomState)
     }
     if (hasPromiseAtomValue(prevAtomState)) {
       const next =
@@ -487,11 +470,28 @@ export const createStore = (): Store => {
   const readAtom = <Value>(atom: Atom<Value>): Value =>
     returnAtomValue(readAtomState(atom))
 
+  const addAtom = (atom: AnyAtom): Mounted => {
+    let mounted = mountedMap.get(atom)
+    if (!mounted) {
+      mounted = mountAtom(atom)
+    }
+    return mounted
+  }
+
+  const delAtom = (atom: AnyAtom): void => {
+    const mounted = mountedMap.get(atom)
+    if (mounted && canUnmountAtom(atom, mounted)) {
+      unmountAtom(atom)
+    }
+  }
+
   const recomputeDependents = (atom: AnyAtom): void => {
     const getDependents = (a: AnyAtom): Dependents => {
       const dependents = new Set(mountedMap.get(a)?.t)
-      pendingMap.get(a)?.[1].forEach((dependent) => {
-        dependents.add(dependent)
+      pendingMap.forEach((_, pendingAtom) => {
+        if (getAtomState(pendingAtom)?.d.has(a)) {
+          dependents.add(pendingAtom)
+        }
       })
       return dependents
     }
@@ -554,15 +554,12 @@ export const createStore = (): Store => {
     atom: WritableAtom<Value, Args, Result>,
     ...args: Args
   ): Result => {
+    let isSync = true
     const getter: Getter = <V>(a: Atom<V>) => returnAtomValue(readAtomState(a))
     const setter: Setter = <V, As extends unknown[], R>(
       a: WritableAtom<V, As, R>,
       ...args: As
     ) => {
-      const isSync = pendingStack.length > 0
-      if (!isSync) {
-        pendingStack.push(new Set([a]))
-      }
       let r: R | undefined
       if (isSelfAtom(atom, a)) {
         if (!hasInitialValue(a)) {
@@ -578,16 +575,17 @@ export const createStore = (): Store => {
         r = writeAtomState(a as AnyWritableAtom, ...args) as R
       }
       if (!isSync) {
-        const flushed = flushPending(pendingStack.pop()!)
+        const flushed = flushPending()
         if (import.meta.env?.MODE !== 'production') {
           storeListenersRev2.forEach((l) =>
-            l({ type: 'async-write', flushed: flushed! }),
+            l({ type: 'async-write', flushed: flushed as Set<AnyAtom> }),
           )
         }
       }
       return r as R
     }
     const result = atom.write(getter, setter, ...args)
+    isSync = false
     return result
   }
 
@@ -595,11 +593,12 @@ export const createStore = (): Store => {
     atom: WritableAtom<Value, Args, Result>,
     ...args: Args
   ): Result => {
-    pendingStack.push(new Set([atom]))
     const result = writeAtomState(atom, ...args)
-    const flushed = flushPending(pendingStack.pop()!)
+    const flushed = flushPending()
     if (import.meta.env?.MODE !== 'production') {
-      storeListenersRev2.forEach((l) => l({ type: 'write', flushed: flushed! }))
+      storeListenersRev2.forEach((l) =>
+        l({ type: 'write', flushed: flushed as Set<AnyAtom> }),
+      )
     }
     return result
   }
@@ -609,19 +608,16 @@ export const createStore = (): Store => {
     initialDependent?: AnyAtom,
     onMountQueue?: (() => void)[],
   ): Mounted => {
-    const existingMount = mountedMap.get(atom)
-    if (existingMount) {
-      if (initialDependent) {
-        existingMount.t.add(initialDependent)
-      }
-      return existingMount
-    }
-
     const queue = onMountQueue || []
     // mount dependencies before mounting self
     getAtomState(atom)?.d.forEach((_, a) => {
-      if (a !== atom) {
-        mountAtom(a, atom, queue)
+      const aMounted = mountedMap.get(a)
+      if (aMounted) {
+        aMounted.t.add(atom) // add dependent
+      } else {
+        if (a !== atom) {
+          mountAtom(a, atom, queue)
+        }
       }
     })
     // recompute atom state
@@ -656,12 +652,9 @@ export const createStore = (): Store => {
     !mounted.l.size &&
     (!mounted.t.size || (mounted.t.size === 1 && mounted.t.has(atom)))
 
-  const tryUnmountAtom = <Value>(atom: Atom<Value>, mounted: Mounted): void => {
-    if (!canUnmountAtom(atom, mounted)) {
-      return
-    }
+  const unmountAtom = <Value>(atom: Atom<Value>): void => {
     // unmount self
-    const onUnmount = mounted.u
+    const onUnmount = mountedMap.get(atom)?.u
     if (onUnmount) {
       onUnmount()
     }
@@ -678,10 +671,12 @@ export const createStore = (): Store => {
       }
       atomState.d.forEach((_, a) => {
         if (a !== atom) {
-          const mountedDep = mountedMap.get(a)
-          if (mountedDep) {
-            mountedDep.t.delete(atom)
-            tryUnmountAtom(a, mountedDep)
+          const mounted = mountedMap.get(a)
+          if (mounted) {
+            mounted.t.delete(atom)
+            if (canUnmountAtom(a, mounted)) {
+              unmountAtom(a)
+            }
           }
         }
       })
@@ -710,68 +705,61 @@ export const createStore = (): Store => {
       }
     })
     depSet.forEach((a) => {
-      mountAtom(a, atom)
+      const mounted = mountedMap.get(a)
+      if (mounted) {
+        mounted.t.add(atom) // add to dependents
+      } else if (mountedMap.has(atom)) {
+        // we mount dependencies only when atom is already mounted
+        // Note: we should revisit this when you find other issues
+        // https://github.com/pmndrs/jotai/issues/942
+        mountAtom(a, atom)
+      }
     })
     maybeUnmountAtomSet.forEach((a) => {
       const mounted = mountedMap.get(a)
-      if (mounted) {
-        tryUnmountAtom(a, mounted)
+      if (mounted && canUnmountAtom(a, mounted)) {
+        unmountAtom(a)
       }
     })
   }
 
-  const flushPending = (
-    pendingAtoms: AnyAtom[] | Set<AnyAtom>,
-  ): void | Set<AnyAtom> => {
+  const flushPending = (): void | Set<AnyAtom> => {
     let flushed: Set<AnyAtom>
     if (import.meta.env?.MODE !== 'production') {
       flushed = new Set()
     }
-    const pending: [AnyAtom, AtomState | undefined][] = []
-    const collectPending = (pendingAtom: AnyAtom) => {
-      if (!pendingMap.has(pendingAtom)) {
-        return
-      }
-      const [prevAtomState, dependents] = pendingMap.get(pendingAtom)!
-      pendingMap.delete(pendingAtom)
-      pending.push([pendingAtom, prevAtomState])
-      dependents.forEach(collectPending)
-      // FIXME might be better if we can avoid collecting from dependencies
-      getAtomState(pendingAtom)?.d.forEach((_, a) => collectPending(a))
-    }
-    pendingAtoms.forEach(collectPending)
-    pending.forEach(([atom, prevAtomState]) => {
-      const atomState = getAtomState(atom)
-      if (!atomState) {
-        if (import.meta.env?.MODE !== 'production') {
+    while (pendingMap.size) {
+      const pending = Array.from(pendingMap)
+      pendingMap.clear()
+      pending.forEach(([atom, prevAtomState]) => {
+        const atomState = getAtomState(atom)
+        if (atomState) {
+          const mounted = mountedMap.get(atom)
+          if (mounted && atomState.d !== prevAtomState?.d) {
+            mountDependencies(atom, atomState, prevAtomState?.d)
+          }
+          if (
+            mounted &&
+            !(
+              // TODO This seems pretty hacky. Hope to fix it.
+              // Maybe we could `mountDependencies` in `setAtomState`?
+              (
+                !hasPromiseAtomValue(prevAtomState) &&
+                (isEqualAtomValue(prevAtomState, atomState) ||
+                  isEqualAtomError(prevAtomState, atomState))
+              )
+            )
+          ) {
+            mounted.l.forEach((listener) => listener())
+            if (import.meta.env?.MODE !== 'production') {
+              flushed.add(atom)
+            }
+          }
+        } else if (import.meta.env?.MODE !== 'production') {
           console.warn('[Bug] no atom state to flush')
         }
-        return
-      }
-      if (atomState !== prevAtomState) {
-        const mounted = mountedMap.get(atom)
-        if (mounted && atomState.d !== prevAtomState?.d) {
-          mountDependencies(atom, atomState, prevAtomState?.d)
-        }
-        if (
-          mounted &&
-          !(
-            // TODO This seems pretty hacky. Hope to fix it.
-            // Maybe we could `mountDependencies` in `setAtomState`?
-            (
-              !hasPromiseAtomValue(prevAtomState) &&
-              (isEqualAtomValue(prevAtomState, atomState) ||
-                isEqualAtomError(prevAtomState, atomState))
-            )
-          )
-        ) {
-          mounted.l.forEach((listener) => listener())
-          if (import.meta.env?.MODE !== 'production') {
-            flushed.add(atom)
-          }
-        }
-      }
-    })
+      })
+    }
     if (import.meta.env?.MODE !== 'production') {
       // @ts-expect-error Variable 'flushed' is used before being assigned.
       return flushed
@@ -779,8 +767,8 @@ export const createStore = (): Store => {
   }
 
   const subscribeAtom = (atom: AnyAtom, listener: () => void) => {
-    const mounted = mountAtom(atom)
-    const flushed = flushPending([atom])
+    const mounted = addAtom(atom)
+    const flushed = flushPending()
     const listeners = mounted.l
     listeners.add(listener)
     if (import.meta.env?.MODE !== 'production') {
@@ -790,7 +778,7 @@ export const createStore = (): Store => {
     }
     return () => {
       listeners.delete(listener)
-      tryUnmountAtom(atom, mounted)
+      delAtom(atom)
       if (import.meta.env?.MODE !== 'production') {
         // devtools uses this to detect if it _can_ unmount or not
         storeListenersRev2.forEach((l) => l({ type: 'unsub' }))
@@ -817,16 +805,15 @@ export const createStore = (): Store => {
       dev_get_atom_state: (a: AnyAtom) => atomStateMap.get(a),
       dev_get_mounted: (a: AnyAtom) => mountedMap.get(a),
       dev_restore_atoms: (values: Iterable<readonly [AnyAtom, AnyValue]>) => {
-        pendingStack.push(new Set())
         for (const [atom, valueOrPromise] of values) {
           if (hasInitialValue(atom)) {
             setAtomValueOrPromise(atom, valueOrPromise)
             recomputeDependents(atom)
           }
         }
-        const flushed = flushPending(pendingStack.pop()!)
+        const flushed = flushPending()
         storeListenersRev2.forEach((l) =>
-          l({ type: 'restore', flushed: flushed! }),
+          l({ type: 'restore', flushed: flushed as Set<AnyAtom> }),
         )
       },
     }
@@ -840,17 +827,25 @@ export const createStore = (): Store => {
 
 let defaultStore: Store | undefined
 
-export const getDefaultStore = (): Store => {
+if (import.meta.env?.MODE !== 'production') {
+  if (typeof (globalThis as any).__NUMBER_OF_JOTAI_INSTANCES__ === 'number') {
+    ++(globalThis as any).__NUMBER_OF_JOTAI_INSTANCES__
+  } else {
+    ;(globalThis as any).__NUMBER_OF_JOTAI_INSTANCES__ = 1
+  }
+}
+
+export const getDefaultStore = () => {
   if (!defaultStore) {
-    defaultStore = createStore()
-    if (import.meta.env?.MODE !== 'production') {
-      ;(globalThis as any).__JOTAI_DEFAULT_STORE__ ||= defaultStore
-      if ((globalThis as any).__JOTAI_DEFAULT_STORE__ !== defaultStore) {
-        console.warn(
-          'Detected multiple Jotai instances. It may cause unexpected behavior with the default store. https://github.com/pmndrs/jotai/discussions/2044',
-        )
-      }
+    if (
+      import.meta.env?.MODE !== 'production' &&
+      (globalThis as any).__NUMBER_OF_JOTAI_INSTANCES__ !== 1
+    ) {
+      console.warn(
+        'Detected multiple Jotai instances. It may cause unexpected behavior with the default store. https://github.com/pmndrs/jotai/discussions/2044',
+      )
     }
+    defaultStore = createStore()
   }
   return defaultStore
 }
