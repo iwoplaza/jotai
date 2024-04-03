@@ -27,6 +27,20 @@ function defaultWrite(get, set, arg) {
   return set(this, typeof arg === 'function' ? arg(get(this)) : arg);
 }
 
+function _extends() {
+  _extends = Object.assign ? Object.assign.bind() : function (target) {
+    for (var i = 1; i < arguments.length; i++) {
+      var source = arguments[i];
+      for (var key in source) {
+        if (Object.prototype.hasOwnProperty.call(source, key)) {
+          target[key] = source[key];
+        }
+      }
+    }
+    return target;
+  };
+  return _extends.apply(this, arguments);
+}
 function _unsupportedIterableToArray(o, minLen) {
   if (!o) return;
   if (typeof o === "string") return _arrayLikeToArray(o, minLen);
@@ -68,224 +82,212 @@ var hasInitialValue = function hasInitialValue(atom) {
 var isActuallyWritableAtom = function isActuallyWritableAtom(atom) {
   return !!atom.write;
 };
-var cancelPromiseMap = new WeakMap();
-var registerCancelPromise = function registerCancelPromise(promise, cancel) {
-  cancelPromiseMap.set(promise, cancel);
-  promise.catch(function () {}).finally(function () {
-    return cancelPromiseMap.delete(promise);
-  });
+var createPendingPair = function createPendingPair() {
+  return [new Set(), new Set()];
 };
-var cancelPromise = function cancelPromise(promise, next) {
-  var cancel = cancelPromiseMap.get(promise);
-  if (cancel) {
-    cancelPromiseMap.delete(promise);
-    cancel(next);
+var addPending = function addPending(pendingPair, pending) {
+  (pendingPair[0] || pendingPair[1]).add(pending);
+};
+var flushPending = function flushPending(pendingPair, isAsync) {
+  var pendingSet;
+  if (isAsync) {
+    if (pendingPair[0]) {
+      return;
+    }
+    pendingSet = pendingPair[1];
+  } else {
+    if (!pendingPair[0]) {
+      throw new Error('[Bug] cannot sync flush twice');
+    }
+    pendingSet = pendingPair[0];
   }
+  var flushed = new Set();
+  while (pendingSet.size) {
+    var copy = new Set(pendingSet);
+    pendingSet.clear();
+    copy.forEach(function (pending) {
+      if (typeof pending === 'function') {
+        pending();
+      } else {
+        var _atom = pending[0],
+          atomState = pending[1];
+        if (!flushed.has(_atom) && atomState.m) {
+          atomState.m.l.forEach(function (listener) {
+            return listener();
+          });
+          flushed.add(_atom);
+        }
+      }
+    });
+  }
+  pendingPair[0] = undefined;
+  return flushed;
 };
-var resolvePromise = function resolvePromise(promise, value) {
-  promise.status = 'fulfilled';
-  promise.value = value;
+var CONTINUE_PROMISE = Symbol(process.env.NODE_ENV !== 'production' ? 'CONTINUE_PROMISE' : '');
+var PENDING = 'pending';
+var FULFILLED = 'fulfilled';
+var REJECTED = 'rejected';
+var isContinuablePromise = function isContinuablePromise(promise) {
+  return typeof promise === 'object' && promise !== null && CONTINUE_PROMISE in promise;
 };
-var rejectPromise = function rejectPromise(promise, e) {
-  promise.status = 'rejected';
-  promise.reason = e;
+var continuablePromiseMap = new WeakMap();
+var createContinuablePromise = function createContinuablePromise(promise, abort, complete) {
+  if (!continuablePromiseMap.has(promise)) {
+    var continuePromise;
+    var p = new Promise(function (resolve, reject) {
+      var curr = promise;
+      var onFullfilled = function onFullfilled(me) {
+        return function (v) {
+          if (curr === me) {
+            p.status = FULFILLED;
+            p.value = v;
+            resolve(v);
+            complete();
+          }
+        };
+      };
+      var onRejected = function onRejected(me) {
+        return function (e) {
+          if (curr === me) {
+            p.status = REJECTED;
+            p.reason = e;
+            reject(e);
+            complete();
+          }
+        };
+      };
+      promise.then(onFullfilled(promise), onRejected(promise));
+      continuePromise = function continuePromise(nextPromise, nextAbort) {
+        if (nextPromise) {
+          continuablePromiseMap.set(nextPromise, p);
+          curr = nextPromise;
+          nextPromise.then(onFullfilled(nextPromise), onRejected(nextPromise));
+        }
+        abort();
+        abort = nextAbort;
+      };
+    });
+    p.status = PENDING;
+    p[CONTINUE_PROMISE] = continuePromise;
+    continuablePromiseMap.set(promise, p);
+  }
+  return continuablePromiseMap.get(promise);
 };
 var isPromiseLike = function isPromiseLike(x) {
   return typeof (x == null ? void 0 : x.then) === 'function';
 };
-var isEqualAtomValue = function isEqualAtomValue(a, b) {
-  return !!a && 'v' in a && 'v' in b && Object.is(a.v, b.v);
-};
-var isEqualAtomError = function isEqualAtomError(a, b) {
-  return !!a && 'e' in a && 'e' in b && Object.is(a.e, b.e);
-};
-var hasPromiseAtomValue = function hasPromiseAtomValue(a) {
-  return !!a && 'v' in a && a.v instanceof Promise;
-};
-var isEqualPromiseAtomValue = function isEqualPromiseAtomValue(a, b) {
-  return 'v' in a && 'v' in b && a.v.orig && a.v.orig === b.v.orig;
+var getPendingContinuablePromise = function getPendingContinuablePromise(atomState) {
+  var _s;
+  var value = (_s = atomState.s) == null ? void 0 : _s.v;
+  if (isContinuablePromise(value) && value.status === PENDING) {
+    return value;
+  }
+  return null;
 };
 var returnAtomValue = function returnAtomValue(atomState) {
-  if ('e' in atomState) {
-    throw atomState.e;
+  if ('e' in atomState.s) {
+    throw atomState.s.e;
   }
-  return atomState.v;
+  return atomState.s.v;
+};
+var setAtomStateValueOrPromise = function setAtomStateValueOrPromise(atomState, valueOrPromise, abortPromise, completePromise) {
+  if (abortPromise === void 0) {
+    abortPromise = function abortPromise() {};
+  }
+  if (completePromise === void 0) {
+    completePromise = function completePromise() {};
+  }
+  var pendingPromise = getPendingContinuablePromise(atomState);
+  if (isPromiseLike(valueOrPromise)) {
+    if (pendingPromise) {
+      if (pendingPromise !== valueOrPromise) {
+        pendingPromise[CONTINUE_PROMISE](valueOrPromise, abortPromise);
+      }
+    } else {
+      var continuablePromise = createContinuablePromise(valueOrPromise, abortPromise, completePromise);
+      atomState.s = {
+        v: continuablePromise
+      };
+    }
+  } else {
+    if (pendingPromise) {
+      pendingPromise[CONTINUE_PROMISE](Promise.resolve(valueOrPromise), abortPromise);
+    }
+    atomState.s = {
+      v: valueOrPromise
+    };
+  }
 };
 var createStore = function createStore() {
   var atomStateMap = new WeakMap();
-  var mountedMap = new WeakMap();
-  var pendingMap = new Map();
+  var getAtomState = function getAtomState(atom) {
+    if (!atomStateMap.has(atom)) {
+      var atomState = {
+        d: new Map(),
+        t: new Set()
+      };
+      atomStateMap.set(atom, atomState);
+    }
+    return atomStateMap.get(atom);
+  };
   var storeListenersRev2;
   var mountedAtoms;
   if (process.env.NODE_ENV !== 'production') {
     storeListenersRev2 = new Set();
     mountedAtoms = new Set();
   }
-  var getAtomState = function getAtomState(atom) {
-    return atomStateMap.get(atom);
+  var clearDependencies = function clearDependencies(atom) {
+    var atomState = getAtomState(atom);
+    for (var _iterator = _createForOfIteratorHelperLoose(atomState.d.keys()), _step; !(_step = _iterator()).done;) {
+      var _a = _step.value;
+      getAtomState(_a).t.delete(atom);
+    }
+    atomState.d.clear();
   };
-  var setAtomState = function setAtomState(atom, atomState) {
-    if (process.env.NODE_ENV !== 'production') {
-      Object.freeze(atomState);
+  var addDependency = function addDependency(atom, a, aState, isSync) {
+    if (process.env.NODE_ENV !== 'production' && a === atom) {
+      throw new Error('[Bug] atom cannot depend on itself');
     }
-    var prevAtomState = getAtomState(atom);
-    atomStateMap.set(atom, atomState);
-    if (!pendingMap.has(atom)) {
-      pendingMap.set(atom, prevAtomState);
+    var atomState = getAtomState(atom);
+    atomState.d.set(a, aState.s);
+    aState.t.add(atom);
+    if (!isSync && atomState.m) {
+      var pendingPair = createPendingPair();
+      mountDependencies(pendingPair, atomState);
+      flushPending(pendingPair);
     }
-    if (hasPromiseAtomValue(prevAtomState)) {
-      var _next = 'v' in atomState ? atomState.v instanceof Promise ? atomState.v : Promise.resolve(atomState.v) : Promise.reject(atomState.e);
-      if (prevAtomState.v !== _next) {
-        cancelPromise(prevAtomState.v, _next);
-      }
-    }
-  };
-  var updateDependencies = function updateDependencies(atom, nextAtomState, nextDependencies, keepPreviousDependencies) {
-    var dependencies = new Map(keepPreviousDependencies ? nextAtomState.d : null);
-    var changed = false;
-    nextDependencies.forEach(function (aState, a) {
-      if (!aState && isSelfAtom(atom, a)) {
-        aState = nextAtomState;
-      }
-      if (aState) {
-        dependencies.set(a, aState);
-        if (nextAtomState.d.get(a) !== aState) {
-          changed = true;
-        }
-      } else if (process.env.NODE_ENV !== 'production') {
-        console.warn('[Bug] atom state not found');
-      }
-    });
-    if (changed || nextAtomState.d.size !== dependencies.size) {
-      nextAtomState.d = dependencies;
-    }
-  };
-  var setAtomValue = function setAtomValue(atom, value, nextDependencies, keepPreviousDependencies) {
-    var prevAtomState = getAtomState(atom);
-    var nextAtomState = {
-      d: (prevAtomState == null ? void 0 : prevAtomState.d) || new Map(),
-      v: value
-    };
-    if (nextDependencies) {
-      updateDependencies(atom, nextAtomState, nextDependencies, keepPreviousDependencies);
-    }
-    if (isEqualAtomValue(prevAtomState, nextAtomState) && prevAtomState.d === nextAtomState.d) {
-      return prevAtomState;
-    }
-    if (hasPromiseAtomValue(prevAtomState) && hasPromiseAtomValue(nextAtomState) && isEqualPromiseAtomValue(prevAtomState, nextAtomState)) {
-      if (prevAtomState.d === nextAtomState.d) {
-        return prevAtomState;
-      } else {
-        nextAtomState.v = prevAtomState.v;
-      }
-    }
-    setAtomState(atom, nextAtomState);
-    return nextAtomState;
-  };
-  var setAtomValueOrPromise = function setAtomValueOrPromise(atom, valueOrPromise, nextDependencies, abortPromise) {
-    if (isPromiseLike(valueOrPromise)) {
-      var continuePromise;
-      var updatePromiseDependencies = function updatePromiseDependencies() {
-        var prevAtomState = getAtomState(atom);
-        if (!hasPromiseAtomValue(prevAtomState) || prevAtomState.v !== promise) {
-          return;
-        }
-        var nextAtomState = setAtomValue(atom, promise, nextDependencies);
-        if (mountedMap.has(atom) && prevAtomState.d !== nextAtomState.d) {
-          mountDependencies(atom, nextAtomState, prevAtomState.d);
-        }
-      };
-      var promise = new Promise(function (resolve, reject) {
-        var settled = false;
-        valueOrPromise.then(function (v) {
-          if (!settled) {
-            settled = true;
-            resolvePromise(promise, v);
-            resolve(v);
-            updatePromiseDependencies();
-          }
-        }, function (e) {
-          if (!settled) {
-            settled = true;
-            rejectPromise(promise, e);
-            reject(e);
-            updatePromiseDependencies();
-          }
-        });
-        continuePromise = function continuePromise(next) {
-          if (!settled) {
-            settled = true;
-            next.then(function (v) {
-              return resolvePromise(promise, v);
-            }, function (e) {
-              return rejectPromise(promise, e);
-            });
-            resolve(next);
-          }
-        };
-      });
-      promise.orig = valueOrPromise;
-      promise.status = 'pending';
-      registerCancelPromise(promise, function (next) {
-        if (next) {
-          continuePromise(next);
-        }
-        abortPromise == null || abortPromise();
-      });
-      return setAtomValue(atom, promise, nextDependencies, true);
-    }
-    return setAtomValue(atom, valueOrPromise, nextDependencies);
-  };
-  var setAtomError = function setAtomError(atom, error, nextDependencies) {
-    var prevAtomState = getAtomState(atom);
-    var nextAtomState = {
-      d: (prevAtomState == null ? void 0 : prevAtomState.d) || new Map(),
-      e: error
-    };
-    if (nextDependencies) {
-      updateDependencies(atom, nextAtomState, nextDependencies);
-    }
-    if (isEqualAtomError(prevAtomState, nextAtomState) && prevAtomState.d === nextAtomState.d) {
-      return prevAtomState;
-    }
-    setAtomState(atom, nextAtomState);
-    return nextAtomState;
   };
   var readAtomState = function readAtomState(atom, force) {
     var atomState = getAtomState(atom);
-    if (!force && atomState) {
-      if (mountedMap.has(atom)) {
+    if (!force && 's' in atomState) {
+      if (atomState.m) {
         return atomState;
       }
       if (Array.from(atomState.d).every(function (_ref) {
         var a = _ref[0],
           s = _ref[1];
-        if (a === atom) {
-          return true;
-        }
         var aState = readAtomState(a);
-        return aState === s || isEqualAtomValue(aState, s);
+        return 'v' in s && 'v' in aState.s && Object.is(s.v, aState.s.v);
       })) {
         return atomState;
       }
     }
-    var nextDependencies = new Map();
+    clearDependencies(atom);
     var isSync = true;
     var getter = function getter(a) {
       if (isSelfAtom(atom, a)) {
         var _aState = getAtomState(a);
-        if (_aState) {
-          nextDependencies.set(a, _aState);
-          return returnAtomValue(_aState);
+        if (!_aState.s) {
+          if (hasInitialValue(a)) {
+            setAtomStateValueOrPromise(_aState, a.init);
+          } else {
+            throw new Error('no atom init');
+          }
         }
-        if (hasInitialValue(a)) {
-          nextDependencies.set(a, undefined);
-          return a.init;
-        }
-        throw new Error('no atom init');
+        return returnAtomValue(_aState);
       }
       var aState = readAtomState(a);
-      nextDependencies.set(a, aState);
+      addDependency(atom, a, aState, isSync);
       return returnAtomValue(aState);
     };
     var controller;
@@ -319,12 +321,22 @@ var createStore = function createStore() {
     };
     try {
       var valueOrPromise = atom.read(getter, options);
-      return setAtomValueOrPromise(atom, valueOrPromise, nextDependencies, function () {
+      setAtomStateValueOrPromise(atomState, valueOrPromise, function () {
         var _controller;
         return (_controller = controller) == null ? void 0 : _controller.abort();
+      }, function () {
+        if (atomState.m) {
+          var pendingPair = createPendingPair();
+          mountDependencies(pendingPair, atomState);
+          flushPending(pendingPair);
+        }
       });
+      return atomState;
     } catch (error) {
-      return setAtomError(atom, error, nextDependencies);
+      atomState.s = {
+        e: error
+      };
+      return atomState;
     } finally {
       isSync = false;
     }
@@ -332,40 +344,16 @@ var createStore = function createStore() {
   var readAtom = function readAtom(atom) {
     return returnAtomValue(readAtomState(atom));
   };
-  var addAtom = function addAtom(atom) {
-    var mounted = mountedMap.get(atom);
-    if (!mounted) {
-      mounted = mountAtom(atom);
-    }
-    return mounted;
-  };
-  var delAtom = function delAtom(atom) {
-    var mounted = mountedMap.get(atom);
-    if (mounted && canUnmountAtom(atom, mounted)) {
-      unmountAtom(atom);
-    }
-  };
-  var recomputeDependents = function recomputeDependents(atom) {
-    var getDependents = function getDependents(a) {
-      var _mountedMap$get;
-      var dependents = new Set((_mountedMap$get = mountedMap.get(a)) == null ? void 0 : _mountedMap$get.t);
-      pendingMap.forEach(function (_, pendingAtom) {
-        var _getAtomState;
-        if ((_getAtomState = getAtomState(pendingAtom)) != null && _getAtomState.d.has(a)) {
-          dependents.add(pendingAtom);
-        }
-      });
-      return dependents;
-    };
-    var topsortedAtoms = new Array();
+  var recomputeDependents = function recomputeDependents(pendingPair, atom) {
+    var topsortedAtoms = [];
     var markedAtoms = new Set();
     var visit = function visit(n) {
       if (markedAtoms.has(n)) {
         return;
       }
       markedAtoms.add(n);
-      for (var _iterator = _createForOfIteratorHelperLoose(getDependents(n)), _step; !(_step = _iterator()).done;) {
-        var m = _step.value;
+      for (var _iterator2 = _createForOfIteratorHelperLoose(getAtomState(n).t), _step2; !(_step2 = _iterator2()).done;) {
+        var m = _step2.value;
         if (n !== m) {
           visit(m);
         }
@@ -375,29 +363,30 @@ var createStore = function createStore() {
     visit(atom);
     var changedAtoms = new Set([atom]);
     for (var i = topsortedAtoms.length - 1; i >= 0; --i) {
-      var _a = topsortedAtoms[i];
-      var prevAtomState = getAtomState(_a);
-      if (!prevAtomState) {
-        continue;
-      }
+      var _a2 = topsortedAtoms[i];
+      var aState = getAtomState(_a2);
+      var prev = aState.s;
       var hasChangedDeps = false;
-      for (var _iterator2 = _createForOfIteratorHelperLoose(prevAtomState.d.keys()), _step2; !(_step2 = _iterator2()).done;) {
-        var dep = _step2.value;
-        if (dep !== _a && changedAtoms.has(dep)) {
+      for (var _iterator3 = _createForOfIteratorHelperLoose(aState.d.keys()), _step3; !(_step3 = _iterator3()).done;) {
+        var dep = _step3.value;
+        if (dep !== _a2 && changedAtoms.has(dep)) {
           hasChangedDeps = true;
           break;
         }
       }
       if (hasChangedDeps) {
-        var nextAtomState = readAtomState(_a, true);
-        if (!isEqualAtomValue(prevAtomState, nextAtomState)) {
-          changedAtoms.add(_a);
+        if (aState.m || getPendingContinuablePromise(aState)) {
+          readAtomState(_a2, true);
+          mountDependencies(pendingPair, aState);
+          if (!prev || !('v' in prev) || !('v' in aState.s) || !Object.is(prev.v, aState.s.v)) {
+            addPending(pendingPair, [_a2, aState]);
+            changedAtoms.add(_a2);
+          }
         }
       }
     }
   };
-  var writeAtomState = function writeAtomState(atom) {
-    var isSync = true;
+  var writeAtomState = function writeAtomState(pendingPair, atom) {
     var getter = function getter(a) {
       return returnAtomValue(readAtomState(a));
     };
@@ -410,40 +399,43 @@ var createStore = function createStore() {
         if (!hasInitialValue(a)) {
           throw new Error('atom not writable');
         }
-        var prevAtomState = getAtomState(a);
-        var nextAtomState = setAtomValueOrPromise(a, args[0]);
-        if (!isEqualAtomValue(prevAtomState, nextAtomState)) {
-          recomputeDependents(a);
+        var aState = getAtomState(a);
+        var prev = aState.s;
+        var v = args[0];
+        setAtomStateValueOrPromise(aState, v);
+        mountDependencies(pendingPair, aState);
+        var curr = aState.s;
+        if (!prev || !('v' in prev) || !('v' in curr) || !Object.is(prev.v, curr.v)) {
+          addPending(pendingPair, [a, aState]);
+          recomputeDependents(pendingPair, a);
         }
       } else {
-        r = writeAtomState.apply(void 0, [a].concat(args));
+        r = writeAtomState.apply(void 0, [pendingPair, a].concat(args));
       }
-      if (!isSync) {
-        var flushed = flushPending();
-        if (process.env.NODE_ENV !== 'production') {
-          storeListenersRev2.forEach(function (l) {
-            return l({
-              type: 'async-write',
-              flushed: flushed
-            });
+      var flushed = flushPending(pendingPair, true);
+      if (process.env.NODE_ENV !== 'production' && flushed) {
+        storeListenersRev2.forEach(function (l) {
+          return l({
+            type: 'async-write',
+            flushed: flushed
           });
-        }
+        });
       }
       return r;
     };
-    for (var _len2 = arguments.length, args = new Array(_len2 > 1 ? _len2 - 1 : 0), _key2 = 1; _key2 < _len2; _key2++) {
-      args[_key2 - 1] = arguments[_key2];
+    for (var _len2 = arguments.length, args = new Array(_len2 > 2 ? _len2 - 2 : 0), _key2 = 2; _key2 < _len2; _key2++) {
+      args[_key2 - 2] = arguments[_key2];
     }
     var result = atom.write.apply(atom, [getter, setter].concat(args));
-    isSync = false;
     return result;
   };
   var writeAtom = function writeAtom(atom) {
+    var pendingPair = createPendingPair();
     for (var _len4 = arguments.length, args = new Array(_len4 > 1 ? _len4 - 1 : 0), _key4 = 1; _key4 < _len4; _key4++) {
       args[_key4 - 1] = arguments[_key4];
     }
-    var result = writeAtomState.apply(void 0, [atom].concat(args));
-    var flushed = flushPending();
+    var result = writeAtomState.apply(void 0, [pendingPair, atom].concat(args));
+    var flushed = flushPending(pendingPair);
     if (process.env.NODE_ENV !== 'production') {
       storeListenersRev2.forEach(function (l) {
         return l({
@@ -454,151 +446,95 @@ var createStore = function createStore() {
     }
     return result;
   };
-  var mountAtom = function mountAtom(atom, initialDependent, onMountQueue) {
-    var _getAtomState2;
-    var queue = onMountQueue || [];
-    (_getAtomState2 = getAtomState(atom)) == null || _getAtomState2.d.forEach(function (_, a) {
-      var aMounted = mountedMap.get(a);
-      if (aMounted) {
-        aMounted.t.add(atom);
-      } else {
-        if (a !== atom) {
-          mountAtom(a, atom, queue);
+  var mountDependencies = function mountDependencies(pendingPair, atomState) {
+    if (atomState.m && !getPendingContinuablePromise(atomState)) {
+      for (var _iterator4 = _createForOfIteratorHelperLoose(atomState.d.keys()), _step4; !(_step4 = _iterator4()).done;) {
+        var _a3 = _step4.value;
+        if (!atomState.m.d.has(_a3)) {
+          mountAtom(pendingPair, _a3);
+          atomState.m.d.add(_a3);
         }
       }
-    });
-    readAtomState(atom);
-    var mounted = {
-      t: new Set(initialDependent && [initialDependent]),
-      l: new Set()
-    };
-    mountedMap.set(atom, mounted);
-    if (process.env.NODE_ENV !== 'production') {
-      mountedAtoms.add(atom);
-    }
-    if (isActuallyWritableAtom(atom) && atom.onMount) {
-      var onMount = atom.onMount;
-      queue.push(function () {
-        var onUnmount = onMount(function () {
-          for (var _len5 = arguments.length, args = new Array(_len5), _key5 = 0; _key5 < _len5; _key5++) {
-            args[_key5] = arguments[_key5];
-          }
-          return writeAtom.apply(void 0, [atom].concat(args));
-        });
-        if (onUnmount) {
-          mounted.u = onUnmount;
+      for (var _iterator5 = _createForOfIteratorHelperLoose(atomState.m.d || []), _step5; !(_step5 = _iterator5()).done;) {
+        var _a4 = _step5.value;
+        if (!atomState.d.has(_a4)) {
+          unmountAtom(pendingPair, _a4);
+          atomState.m.d.delete(_a4);
         }
-      });
+      }
     }
-    if (!onMountQueue) {
-      queue.forEach(function (f) {
-        return f();
-      });
-    }
-    return mounted;
   };
-  var canUnmountAtom = function canUnmountAtom(atom, mounted) {
-    return !mounted.l.size && (!mounted.t.size || mounted.t.size === 1 && mounted.t.has(atom));
-  };
-  var unmountAtom = function unmountAtom(atom) {
-    var _mountedMap$get2;
-    var onUnmount = (_mountedMap$get2 = mountedMap.get(atom)) == null ? void 0 : _mountedMap$get2.u;
-    if (onUnmount) {
-      onUnmount();
-    }
-    mountedMap.delete(atom);
-    if (process.env.NODE_ENV !== 'production') {
-      mountedAtoms.delete(atom);
-    }
+  var mountAtom = function mountAtom(pendingPair, atom) {
     var atomState = getAtomState(atom);
-    if (atomState) {
-      if (hasPromiseAtomValue(atomState)) {
-        cancelPromise(atomState.v);
+    if (!atomState.m) {
+      readAtomState(atom);
+      for (var _iterator6 = _createForOfIteratorHelperLoose(atomState.d.keys()), _step6; !(_step6 = _iterator6()).done;) {
+        var _a5 = _step6.value;
+        mountAtom(pendingPair, _a5);
       }
-      atomState.d.forEach(function (_, a) {
-        if (a !== atom) {
-          var mounted = mountedMap.get(a);
-          if (mounted) {
-            mounted.t.delete(atom);
-            if (canUnmountAtom(a, mounted)) {
-              unmountAtom(a);
+      atomState.m = {
+        l: new Set(),
+        d: new Set(atomState.d.keys())
+      };
+      if (process.env.NODE_ENV !== 'production') {
+        mountedAtoms.add(atom);
+      }
+      if (isActuallyWritableAtom(atom) && atom.onMount) {
+        var mounted = atomState.m;
+        var onMount = atom.onMount;
+        addPending(pendingPair, function () {
+          var onUnmount = onMount(function () {
+            for (var _len5 = arguments.length, args = new Array(_len5), _key5 = 0; _key5 < _len5; _key5++) {
+              args[_key5] = arguments[_key5];
             }
+            return writeAtomState.apply(void 0, [pendingPair, atom].concat(args));
+          });
+          if (onUnmount) {
+            mounted.u = onUnmount;
           }
-        }
-      });
-    } else if (process.env.NODE_ENV !== 'production') {
-      console.warn('[Bug] could not find atom state to unmount', atom);
+        });
+      }
     }
+    return atomState.m;
   };
-  var mountDependencies = function mountDependencies(atom, atomState, prevDependencies) {
-    var depSet = new Set(atomState.d.keys());
-    var maybeUnmountAtomSet = new Set();
-    prevDependencies == null || prevDependencies.forEach(function (_, a) {
-      if (depSet.has(a)) {
-        depSet.delete(a);
-        return;
+  var unmountAtom = function unmountAtom(pendingPair, atom) {
+    var atomState = getAtomState(atom);
+    if (atomState.m && !atomState.m.l.size && !Array.from(atomState.t).some(function (a) {
+      return getAtomState(a).m;
+    })) {
+      var onUnmount = atomState.m.u;
+      if (onUnmount) {
+        addPending(pendingPair, onUnmount);
       }
-      maybeUnmountAtomSet.add(a);
-      var mounted = mountedMap.get(a);
-      if (mounted) {
-        mounted.t.delete(atom);
+      delete atomState.m;
+      if (process.env.NODE_ENV !== 'production') {
+        mountedAtoms.delete(atom);
       }
-    });
-    depSet.forEach(function (a) {
-      var mounted = mountedMap.get(a);
-      if (mounted) {
-        mounted.t.add(atom);
-      } else if (mountedMap.has(atom)) {
-        mountAtom(a, atom);
+      for (var _iterator7 = _createForOfIteratorHelperLoose(atomState.d.keys()), _step7; !(_step7 = _iterator7()).done;) {
+        var _a6 = _step7.value;
+        unmountAtom(pendingPair, _a6);
       }
-    });
-    maybeUnmountAtomSet.forEach(function (a) {
-      var mounted = mountedMap.get(a);
-      if (mounted && canUnmountAtom(a, mounted)) {
-        unmountAtom(a);
+      var pendingPromise = getPendingContinuablePromise(atomState);
+      if (pendingPromise) {
+        pendingPromise[CONTINUE_PROMISE](undefined, function () {});
       }
-    });
-  };
-  var flushPending = function flushPending() {
-    var flushed;
-    if (process.env.NODE_ENV !== 'production') {
-      flushed = new Set();
-    }
-    while (pendingMap.size) {
-      var pending = Array.from(pendingMap);
-      pendingMap.clear();
-      pending.forEach(function (_ref2) {
-        var atom = _ref2[0],
-          prevAtomState = _ref2[1];
-        var atomState = getAtomState(atom);
-        if (atomState) {
-          var mounted = mountedMap.get(atom);
-          if (mounted && atomState.d !== (prevAtomState == null ? void 0 : prevAtomState.d)) {
-            mountDependencies(atom, atomState, prevAtomState == null ? void 0 : prevAtomState.d);
-          }
-          if (mounted && !(!hasPromiseAtomValue(prevAtomState) && (isEqualAtomValue(prevAtomState, atomState) || isEqualAtomError(prevAtomState, atomState)))) {
-            mounted.l.forEach(function (listener) {
-              return listener();
-            });
-            if (process.env.NODE_ENV !== 'production') {
-              flushed.add(atom);
-            }
-          }
-        } else if (process.env.NODE_ENV !== 'production') {
-          console.warn('[Bug] no atom state to flush');
-        }
-      });
-    }
-    if (process.env.NODE_ENV !== 'production') {
-      return flushed;
     }
   };
   var subscribeAtom = function subscribeAtom(atom, listener) {
-    var mounted = addAtom(atom);
-    var flushed = flushPending();
+    var prevMounted;
+    if (process.env.NODE_ENV !== 'production') {
+      var _atomStateMap$get;
+      prevMounted = (_atomStateMap$get = atomStateMap.get(atom)) == null ? void 0 : _atomStateMap$get.m;
+    }
+    var pendingPair = createPendingPair();
+    var mounted = mountAtom(pendingPair, atom);
+    var flushed = flushPending(pendingPair);
     var listeners = mounted.l;
     listeners.add(listener);
     if (process.env.NODE_ENV !== 'production') {
+      if (!prevMounted) {
+        flushed.add(atom);
+      }
       storeListenersRev2.forEach(function (l) {
         return l({
           type: 'sub',
@@ -608,7 +544,9 @@ var createStore = function createStore() {
     }
     return function () {
       listeners.delete(listener);
-      delAtom(atom);
+      var pendingPair = createPendingPair();
+      unmountAtom(pendingPair, atom);
+      flushPending(pendingPair);
       if (process.env.NODE_ENV !== 'production') {
         storeListenersRev2.forEach(function (l) {
           return l({
@@ -636,22 +574,36 @@ var createStore = function createStore() {
         return mountedAtoms.values();
       },
       dev_get_atom_state: function dev_get_atom_state(a) {
-        return atomStateMap.get(a);
+        var getOldAtomState = function getOldAtomState(a) {
+          var aState = atomStateMap.get(a);
+          return aState && aState.s && _extends({
+            d: new Map(Array.from(aState.d.keys()).flatMap(function (a) {
+              var s = getOldAtomState(a);
+              return s ? [[a, s]] : [];
+            }))
+          }, aState.s);
+        };
+        return getOldAtomState(a);
       },
       dev_get_mounted: function dev_get_mounted(a) {
-        return mountedMap.get(a);
+        var aState = atomStateMap.get(a);
+        return aState && aState.m && _extends({
+          l: aState.m.l,
+          t: new Set([].concat(aState.t, [a]))
+        }, aState.m.u ? {
+          u: aState.m.u
+        } : {});
       },
       dev_restore_atoms: function dev_restore_atoms(values) {
-        for (var _iterator3 = _createForOfIteratorHelperLoose(values), _step3; !(_step3 = _iterator3()).done;) {
-          var _step3$value = _step3.value,
-            _atom = _step3$value[0],
-            valueOrPromise = _step3$value[1];
-          if (hasInitialValue(_atom)) {
-            setAtomValueOrPromise(_atom, valueOrPromise);
-            recomputeDependents(_atom);
-          }
+        var pendingPair = createPendingPair();
+        for (var _iterator8 = _createForOfIteratorHelperLoose(values), _step8; !(_step8 = _iterator8()).done;) {
+          var _step8$value = _step8.value,
+            _atom2 = _step8$value[0],
+            value = _step8$value[1];
+          setAtomStateValueOrPromise(getAtomState(_atom2), value);
+          recomputeDependents(pendingPair, _atom2);
         }
-        var flushed = flushPending();
+        var flushed = flushPending(pendingPair);
         storeListenersRev2.forEach(function (l) {
           return l({
             type: 'restore',
@@ -668,19 +620,16 @@ var createStore = function createStore() {
   };
 };
 var defaultStore;
-if (process.env.NODE_ENV !== 'production') {
-  if (typeof globalThis.__NUMBER_OF_JOTAI_INSTANCES__ === 'number') {
-    ++globalThis.__NUMBER_OF_JOTAI_INSTANCES__;
-  } else {
-    globalThis.__NUMBER_OF_JOTAI_INSTANCES__ = 1;
-  }
-}
 var getDefaultStore = function getDefaultStore() {
   if (!defaultStore) {
-    if (process.env.NODE_ENV !== 'production' && globalThis.__NUMBER_OF_JOTAI_INSTANCES__ !== 1) {
-      console.warn('Detected multiple Jotai instances. It may cause unexpected behavior with the default store. https://github.com/pmndrs/jotai/discussions/2044');
-    }
     defaultStore = createStore();
+    if (process.env.NODE_ENV !== 'production') {
+      var _ref2;
+      (_ref2 = globalThis).__JOTAI_DEFAULT_STORE__ || (_ref2.__JOTAI_DEFAULT_STORE__ = defaultStore);
+      if (globalThis.__JOTAI_DEFAULT_STORE__ !== defaultStore) {
+        console.warn('Detected multiple Jotai instances. It may cause unexpected behavior with the default store. https://github.com/pmndrs/jotai/discussions/2044');
+      }
+    }
   }
   return defaultStore;
 };
