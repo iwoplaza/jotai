@@ -181,8 +181,6 @@ type Mounted = {
   readonly d: Set<AnyAtom>
   /** Set of mounted atoms that depends on the atom. */
   readonly t: Set<AnyAtom>
-  /** Set of pending atoms that depends on the atom. */
-  readonly p: Set<AnyAtom>
   /** Function to run when the atom is unmounted. */
   u?: OnUnmount
 }
@@ -197,6 +195,8 @@ type AtomState<Value = AnyValue> = {
    * The map value is value/error of the dependency.
    */
   readonly d: Map<AnyAtom, { readonly v: AnyValue } | { readonly e: AnyError }>
+  /** Set of pending atoms that depends on the atom. */
+  readonly p: Set<AnyAtom>
   /** Object to store mounted state of the atom. */
   m?: Mounted // only available if the atom is mounted
   /** Atom value, atom error or empty. */
@@ -296,7 +296,7 @@ export const createStore = (): Store => {
   const getAtomState = <Value>(atom: Atom<Value>) => {
     let atomState = atomStateMap.get(atom) as AtomState<Value> | undefined
     if (!atomState) {
-      atomState = { d: new Map() }
+      atomState = { d: new Map(), p: new Set() }
       atomStateMap.set(atom, atomState)
     }
     return atomState
@@ -315,6 +315,7 @@ export const createStore = (): Store => {
     const atomState = getAtomState(atom)
     for (const a of atomState.d.keys()) {
       getAtomState(a).m?.t.delete(atom)
+      getAtomState(a).p.delete(atom)
     }
     atomState.d.clear()
   }
@@ -332,6 +333,9 @@ export const createStore = (): Store => {
     atomState.d.set(a, aState.s)
     if (atomState.m) {
       aState.m?.t.add(atom)
+    }
+    if (getPendingContinuablePromise(atomState)) {
+      aState.p.add(atom)
     }
     if (!isSync && atomState.m) {
       const pendingPair = createPendingPair()
@@ -378,7 +382,10 @@ export const createStore = (): Store => {
         const aState = getAtomState(a)
         if (!aState.s) {
           if (hasInitialValue(a)) {
-            setAtomStateValueOrPromise(aState, a.init)
+            setAtomStateValueOrPromise(aState, a.init, undefined, () => {
+              notifyDependencies(a, aState)
+            })
+            notifyDependencies(a, aState)
           } else {
             // NOTE invalid derived atoms can reach here
             throw new Error('no atom init')
@@ -427,6 +434,7 @@ export const createStore = (): Store => {
         valueOrPromise,
         () => controller?.abort(),
         () => {
+          notifyDependencies(atom, atomState)
           if (atomState.m) {
             const pendingPair = createPendingPair()
             mountDependencies(pendingPair, atomState)
@@ -439,6 +447,7 @@ export const createStore = (): Store => {
           }
         },
       )
+      notifyDependencies(atom, atomState)
       return atomState as WithS<typeof atomState>
     } catch (error) {
       atomState.s = { e: error }
@@ -465,14 +474,14 @@ export const createStore = (): Store => {
         return
       }
       markedAtoms.add(n)
-      const nMounted = getAtomState(n).m
-      for (const m of nMounted?.t ?? []) {
+      const nState = getAtomState(n)
+      for (const m of nState.m?.t ?? []) {
         // we shouldn't use isSelfAtom here.
         if (n !== m) {
           visit(m)
         }
       }
-      for (const m of nMounted?.p ?? []) {
+      for (const m of nState.p) {
         // we shouldn't use isSelfAtom here.
         if (n !== m) {
           visit(m)
@@ -535,7 +544,9 @@ export const createStore = (): Store => {
         const aState = getAtomState(a)
         const prev = aState.s
         const v = args[0] as V
-        setAtomStateValueOrPromise(aState, v)
+        setAtomStateValueOrPromise(aState, v, undefined, () => {
+          notifyDependencies(a, aState)
+        })
         mountDependencies(pendingPair, aState)
         const curr = (aState as WithS<typeof aState>).s
         if (
@@ -547,6 +558,8 @@ export const createStore = (): Store => {
           addPending(pendingPair, [a, aState])
           recomputeDependents(pendingPair, a)
         }
+
+        notifyDependencies(a, aState)
       } else {
         r = writeAtomState(pendingPair, a as AnyWritableAtom, ...args) as R
       }
@@ -577,6 +590,21 @@ export const createStore = (): Store => {
       devListenersRev2.forEach((l) => l({ type: 'write', flushed }))
     }
     return result
+  }
+
+  const notifyDependencies = <Value>(
+    atom: Atom<Value>,
+    atomState: AtomState,
+  ) => {
+    if (getPendingContinuablePromise(atomState)) {
+      for (const a of atomState.d.keys()) {
+        getAtomState(a).p.add(atom)
+      }
+    } else {
+      for (const a of atomState.d.keys()) {
+        getAtomState(a).p.delete(atom)
+      }
+    }
   }
 
   const mountDependencies = (
@@ -613,7 +641,6 @@ export const createStore = (): Store => {
         l: new Set(),
         d: new Set(atomState.d.keys()),
         t: new Set(),
-        p: new Set(),
       }
       if (import.meta.env?.MODE !== 'production') {
         mountedAtoms.add(atom)
