@@ -4,10 +4,25 @@ on:
   issue_comment:
     types: [created]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ecosystem-ci-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
   trigger:
     runs-on: ubuntu-latest
-    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/ecosystem-ci run') }}
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/ecosystem-ci run') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
