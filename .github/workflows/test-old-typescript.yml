@@ -6,6 +6,9 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+permissions:
+  contents: read
+
 jobs:
   test_old_typescript:
     runs-on: ubuntu-latest
@@ -61,10 +64,11 @@ jobs:
           sed -i~ 's/"include": .*/"include": ["src\/types.d.ts", "dist\/**\/*", "tests\/**\/*"],/' tsconfig.json
       - name: Patch for specific TS version
         run: |
-          ts_ver_esc=${{ matrix.typescript }}
-          ts_ver_esc=${ts_ver_esc//./\\.}
+          ts_ver_esc=${TS_VER//./\\.}
           sed -i~ "s/\/\/ @ts-expect-error .*\[SKIP-TS-${ts_ver_esc}\].*//" tests/*/*.tsx tests/*/*/*.tsx
           sed -i~ "s/\/\/ .*\[ONLY-TS-${ts_ver_esc}\].* @ts-ignore/\/\/ @ts-ignore/" tests/*/*.tsx tests/*/*/*.tsx
+        env:
+          TS_VER: ${{ matrix.typescript }}
       - name: Patch for Old TS
         if: ${{ matrix.typescript == '4.7.4' || matrix.typescript == '4.6.4' || matrix.typescript == '4.5.5' || matrix.typescript == '4.4.4' || matrix.typescript == '4.3.5' || matrix.typescript == '4.2.3' || matrix.typescript == '4.1.5' ||  matrix.typescript == '4.0.5' || startsWith(matrix.typescript, '3.') }}
         run: |
@@ -89,7 +93,9 @@ jobs:
           pnpm add -D @types/prettier@2.4.2 @types/node@18.11.18 @types/yargs@17.0.13 @types/react@18.2.56
           rm -r tests/react/vanilla-utils/atomWithObservable.*
       - name: Install old TypeScript
-        run: pnpm add -D typescript@${{ matrix.typescript }}
+        run: pnpm add -D typescript@$TS_VER
+        env:
+          TS_VER: ${{ matrix.typescript }}
       - name: Patch testing setup for Old TS
         if: ${{ matrix.typescript == '4.6.4' || matrix.typescript == '4.5.5' || matrix.typescript == '4.4.4' || matrix.typescript == '4.3.5' || matrix.typescript == '4.2.3' || matrix.typescript == '4.1.5' ||  matrix.typescript == '4.0.5' || startsWith(matrix.typescript, '3.') }}
         run: |
